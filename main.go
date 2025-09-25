@@ -2,18 +2,24 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"path"
+	"regexp"
+	"strings"
+	"sync"
+
+	"github.com/elazarl/goproxy"
 	"github.com/wwengg/douyin/fay/impl"
 	"github.com/wwengg/douyin/model"
 	"github.com/wwengg/douyin/proto"
 	"github.com/wwengg/douyin/utils"
-	"io"
-	"log"
-	"net/http"
-	"strings"
-
-	"github.com/elazarl/goproxy"
 )
 
 func main() {
@@ -102,24 +108,42 @@ func main() {
 		return err
 	}
 
-	proxy.OnRequest(goproxy.ReqHostIs("webcast.amemv.com:443", "frontier-im.douyin.com:443", "webcast100-ws-web-lq.amemv.com:443", "webcast3-ws-web-lf.douyin.com:443", "webcast3-ws-web-hl.douyin.com:443")).
+	proxy.OnRequest(goproxy.ReqHostMatches(regexp.MustCompile(".*(douyin|amemv)\\.com:443$"))).
 		HandleConnect(goproxy.AlwaysMitm)
 
-	proxy.OnResponse(goproxy.UrlHasPrefix("httpswebcast.amemv.com:443/webcast/room/create/")).DoFunc(
-		func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
-			buf, _ := io.ReadAll(resp.Body)
-			responseStream := io.NopCloser(bytes.NewBuffer(buf))
-			rtmpLive := RtmpLive{}
-			json.Unmarshal(buf, &rtmpLive)
+	streamExtractor := NewStreamExtractor()
 
-			log.Println(rtmpLive)
-			url := rtmpLive.Data.StreamUrl.RtmpPushUrl
-			array := strings.Split(url, "/")
-			secret := array[len(array)-1]
-			serverName := strings.Split(url, secret)[0]
-			log.Printf(`服务器：%s`, serverName)
-			log.Printf(`推流码：%s`, secret)
-			resp.Body = responseStream
+	proxy.OnResponse().DoFunc(
+		func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+			if resp == nil || resp.Body == nil || resp.Request == nil || resp.Request.URL == nil {
+				return resp
+			}
+
+			host := resp.Request.URL.Host
+			if !strings.Contains(host, "douyin.com") && !strings.Contains(host, "amemv.com") {
+				return resp
+			}
+
+			rawBody, err := io.ReadAll(resp.Body)
+			if err != nil {
+				resp.Body = io.NopCloser(bytes.NewBuffer(rawBody))
+				return resp
+			}
+
+			resp.Body = io.NopCloser(bytes.NewBuffer(rawBody))
+
+			body := rawBody
+			if strings.Contains(resp.Header.Get("Content-Encoding"), "gzip") {
+				gzipReader, gzipErr := gzip.NewReader(bytes.NewReader(rawBody))
+				if gzipErr == nil {
+					defer gzipReader.Close()
+					if decoded, decodeErr := io.ReadAll(gzipReader); decodeErr == nil {
+						body = decoded
+					}
+				}
+			}
+
+			streamExtractor.ExtractAndLog(body)
 			return resp
 		},
 	)
@@ -133,4 +157,85 @@ type RtmpLive struct {
 			RtmpPushUrl string `json:"rtmp_push_url"`
 		} `json:"stream_url"`
 	} `json:"data"`
+}
+
+type StreamExtractor struct {
+	lastURL string
+	mu      sync.Mutex
+	regex   *regexp.Regexp
+}
+
+func NewStreamExtractor() *StreamExtractor {
+	return &StreamExtractor{
+		regex: regexp.MustCompile(`rtmp://[^"\\s]+`),
+	}
+}
+
+func (s *StreamExtractor) ExtractAndLog(body []byte) {
+	if len(body) == 0 {
+		return
+	}
+
+	var payload interface{}
+	if err := json.Unmarshal(body, &payload); err == nil {
+		s.extractFromInterface(payload)
+		return
+	}
+
+	matches := s.regex.FindAllString(string(body), -1)
+	s.logMatches(matches)
+}
+
+func (s *StreamExtractor) extractFromInterface(node interface{}) {
+	switch value := node.(type) {
+	case map[string]interface{}:
+		for _, v := range value {
+			s.extractFromInterface(v)
+		}
+	case []interface{}:
+		for _, v := range value {
+			s.extractFromInterface(v)
+		}
+	case string:
+		s.logMatches([]string{value})
+	}
+}
+
+func (s *StreamExtractor) logMatches(matches []string) {
+	for _, match := range matches {
+		if !strings.HasPrefix(match, "rtmp://") {
+			continue
+		}
+		s.logStreamURL(match)
+	}
+}
+
+func (s *StreamExtractor) logStreamURL(rtmpURL string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if rtmpURL == "" || rtmpURL == s.lastURL {
+		return
+	}
+	s.lastURL = rtmpURL
+
+	parsed, err := url.Parse(rtmpURL)
+	if err != nil {
+		log.Printf("检测到推流地址：%s", rtmpURL)
+		return
+	}
+
+	serverPath, streamKey := path.Split(parsed.Path)
+	if streamKey == "" {
+		streamKey = strings.TrimPrefix(serverPath, "/")
+		serverPath = "/"
+	}
+
+	if parsed.RawQuery != "" {
+		streamKey = fmt.Sprintf("%s?%s", streamKey, parsed.RawQuery)
+	}
+
+	server := fmt.Sprintf("%s://%s%s", parsed.Scheme, parsed.Host, serverPath)
+	log.Printf("服务器：%s", server)
+	log.Printf("推流码：%s", streamKey)
 }
