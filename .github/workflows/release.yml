@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'         # 推送 v 开头的 tag 会触发，比如 v0.1.0
+  workflow_dispatch:  # 也允许手动点运行（但请尽量用 tag 触发）
+
+permissions:
+  contents: write     # 允许创建 Release、上传文件
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+    env:
+      # >>> 按你的项目修改入口 <<<
+      MAIN_PKG: ./          # 若入口在 ./cmd/douyin，请改成 ./cmd/douyin
+      BINARY_NAME: douyin   # 生成的可执行文件基本名
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'   # 也可改 1.20/1.21，建议 >=1.20
+
+      - name: Build
+        run: |
+          mkdir -p dist
+          BASENAME="${BINARY_NAME}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          OUT="dist/${BASENAME}"
+          # Windows 可执行文件带 .exe
+          if [ "${{ matrix.goos }}" = "windows" ]; then OUT="${OUT}.exe"; fi
+          echo "Building $OUT from $MAIN_PKG"
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
+            go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" \
+            -o "$OUT" "$MAIN_PKG"
+
+      - name: Package
+        run: |
+          mkdir -p release
+          BASENAME="${BINARY_NAME}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip -j "release/${BASENAME}.zip" "dist/${BASENAME}.exe"
+            (cd release && sha256sum "${BASENAME}.zip" > "${BASENAME}.zip.sha256")
+          else
+            tar -C dist -czf "release/${BASENAME}.tar.gz" "${BASENAME}"
+            (cd release && sha256sum "${BASENAME}.tar.gz" > "${BASENAME}.tar.gz.sha256")
+          fi
+
+      - name: Upload build artifacts (for next job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ matrix.goos }}-${{ matrix.goarch }}"
+          path: release/*
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-*"
+          merge-multiple: true
+          path: release
+
+      - name: Combine checksums
+        run: |
+          cd release
+          cat *.sha256 > checksums.txt
+          ls -lah
+
+      - name: Create GitHub Release & upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}   # 即 v0.1.0
+          name: ${{ github.ref_name }}
+          body: |
+            Automated release for ${{ github.ref_name }}.
+            Commit: ${{ github.sha }}
+          files: |
+            release/*
